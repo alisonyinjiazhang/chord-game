@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chord Runner</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: #0d0d1a;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    min-height: 100vh; font-family: monospace;
+    overflow: hidden; user-select: none;
+  }
+  canvas { display: block; image-rendering: pixelated; }
+  #hint { color: #252535; font-size: 11px; margin-top: 7px; letter-spacing: 0.5px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">hold all chord keys together · A S D F G H J K = white keys (C D E F G A B C)</div>
+<script>
+'use strict';
+
+const cv  = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = 900, H = 530;
+cv.width = W; cv.height = H;
+
+const PIANO  = 92;
+const GH     = H - PIANO;
+const GND    = GH - 96;
+const PLX    = 96;
+
+// ─── KEY LAYOUT ────────────────────────────────────────────────────────
+const WKS = ['a','s','d','f','g','h','j','k'];
+const BKS = [{k:'w',p:0},{k:'e',p:1},{k:'t',p:3},{k:'y',p:4},{k:'u',p:5}];
+
+// keyboard key → note label (for piano display)
+const NOTE = {
+  a:'C', s:'D', d:'E', f:'F', g:'G', h:'A', j:'B', k:'C',
+  w:'C#', e:'D#', t:'F#', y:'G#', u:'A#'
+};
+
+// keyboard key → frequency
+const FREQ = {
+  a:261.63, w:277.18, s:293.66, e:311.13,
+  d:329.63, f:349.23, t:369.99, g:392.00,
+  y:415.30, h:440.00, u:466.16, j:493.88, k:523.25
+};
+
+// ─── AUDIO ─────────────────────────────────────────────────────────────
+let AC = null;
+function getAC() {
+  if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+  if (AC.state === 'suspended') AC.resume();
+  return AC;
+}
+const oscs = {};
+
+function noteOn(k) {
+  if (!FREQ[k]) return; noteOff(k);
+  const a = getAC(), t = a.currentTime;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = 'triangle'; o.frequency.value = FREQ[k];
+  o.connect(g); g.connect(a.destination);
+  g.gain.setValueAtTime(0,t);
+  g.gain.linearRampToValueAtTime(0.22, t+0.008);
+  g.gain.exponentialRampToValueAtTime(0.10, t+0.3);
+  o.start(t); oscs[k] = {o,g};
+}
+function noteOff(k) {
+  const n = oscs[k]; if (!n) return;
+  const a = getAC(), t = a.currentTime;
+  n.g.gain.setValueAtTime(n.g.gain.value,t);
+  n.g.gain.exponentialRampToValueAtTime(0.0001,t+0.3);
+  n.o.stop(t+0.35); delete oscs[k];
+}
+function sfxSuccess() {
+  const a = getAC();
+  [523.25,659.25,783.99,1046.5].forEach((f,i) => {
+    const t = a.currentTime + i*0.08;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type='triangle'; o.frequency.value=f;
+    o.connect(g); g.connect(a.destination);
+    g.gain.setValueAtTime(0,t);
+    g.gain.linearRampToValueAtTime(0.28,t+0.01);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.28);
+    o.start(t); o.stop(t+0.32);
+  });
+}
+function sfxHit() {
+  const a = getAC(), t = a.currentTime;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type='sawtooth'; o.frequency.setValueAtTime(100,t);
+  o.frequency.exponentialRampToValueAtTime(30,t+0.22);
+  o.connect(g); g.connect(a.destination);
+  g.gain.setValueAtTime(0.35,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+0.25);
+  o.start(t); o.stop(t+0.28);
+}
+
+// ─── CHORD DEFINITIONS ─────────────────────────────────────────────────
+// Keys are sorted LEFT→RIGHT on the keyboard.
+// White key note order:  a=C  s=D  d=E  f=F  g=G  h=A  j=B  k=C5
+//
+//  C  major  C–E–G       →  a  d  g
+//  Am minor  C–E–A (1st) →  a  d  h
+//  Em minor  E–G–B       →  d  g  j
+//  Dm minor  D–F–A       →  s  f  h
+//  F  major  F–A–C5      →  f  h  k
+//  G  major  D–G–B (2nd) →  s  g  j   ← D below G keeps order L→R
+
+const CHORDS = [
+  { name:'C',  keys:['a','d','g'], notes:'C – E – G', color:'#FF6B6B' },
+  { name:'Am', keys:['a','d','h'], notes:'C – E – A', color:'#FFAA33' },
+  { name:'Em', keys:['d','g','j'], notes:'E – G – B', color:'#33DD88' },
+  { name:'Dm', keys:['s','f','h'], notes:'D – F – A', color:'#44BBFF' },
+  { name:'F',  keys:['f','h','k'], notes:'F – A – C', color:'#BB77FF' },
+  { name:'G',  keys:['s','g','j'], notes:'D – G – B', color:'#FF8844' },
+];
+
+function rndChord(not) {
+  const pool = not ? CHORDS.filter(c => c.name !== not.name) : CHORDS;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ─── GAME STATE ────────────────────────────────────────────────────────
+let state = 'start';
+let score = 0, lives = 10, combo = 0;
+let spawnCD = 0, spawnRate = 2800, gameSpd = 1;
+let target = CHORDS[0];
+let tick = 0, shake = 0, hitCool = 0;
+
+const player   = { x:PLX, y:GND, vy:0, falling:false };
+const enemies  = [];
+const sparks   = [];
+const pops     = [];
+
+const held = new Set();
+
+// ─── INPUT ─────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (e.repeat) return;
+  if (state !== 'playing') {
+    if (k===' '||k==='enter') { e.preventDefault(); startGame(); }
+    return;
+  }
+  if (k===' ') { e.preventDefault(); return; }
+  if (FREQ[k]) { held.add(k); noteOn(k); evalChord(); }
+});
+document.addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  held.delete(k); noteOff(k);
+});
+
+// The chord the player actually needs to play right now = nearest live enemy's chord.
+// Falls back to target when no enemy is on screen yet.
+function activeChord() {
+  const e = enemies.find(e => e.alive && e.x > player.x + 10);
+  return e ? e.chord : target;
+}
+
+function evalChord() {
+  if (tick - hitCool < 8) return;
+  const ch = activeChord();
+  const mu = [...held].filter(k => FREQ[k]);
+  if (mu.length !== ch.keys.length) return;
+  if (!ch.keys.every(k => held.has(k))) return;
+  if (mu.some(k => !ch.keys.includes(k))) return;
+  hitCool = tick;
+  onHit();
+}
+
+// ─── LOGIC ─────────────────────────────────────────────────────────────
+function startGame() {
+  state='playing'; score=0; lives=10; combo=0;
+  gameSpd=1; spawnCD=1000; spawnRate=2800;
+  enemies.length=0; sparks.length=0; pops.length=0;
+  player.y=GND; player.vy=0; player.falling=false;
+  target=rndChord(); tick=0;
+}
+
+function onHit() {
+  player.vy=-14; player.falling=true;
+  shake=3; sfxSuccess();
+  const e = enemies.find(e => e.alive && e.x > player.x+10);
+  if (e) {
+    e.alive=false; e.diedAt=tick;
+    burst(e.x, e.y-28, e.chord.color);
+    const pts = 100*Math.max(1,combo);
+    score+=pts; combo++;
+    pops.push({x:e.x, y:e.y-70, txt:'+'+pts, col:e.chord.color, life:1});
+    spawnRate=Math.max(1100, spawnRate-20);
+  }
+  target=rndChord(target);
+}
+
+function spawnEnemy() {
+  enemies.push({
+    x:W+36, y:GND, chord:target,
+    speed:1.3+gameSpd*0.28,
+    alive:true, diedAt:-1, wf:0,
+  });
+}
+
+function burst(x,y,col) {
+  for (let i=0;i<18;i++) {
+    const a=(i/18)*Math.PI*2, spd=2.5+Math.random()*4.5;
+    sparks.push({x,y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd-2,col,sz:5+Math.random()*4,life:1});
+  }
+}
+
+// ─── DRAW: WORLD ───────────────────────────────────────────────────────
+function drawSky() {
+  const g=ctx.createLinearGradient(0,0,0,GH);
+  g.addColorStop(0,'#5BA4CF'); g.addColorStop(0.65,'#9DD5F0'); g.addColorStop(1,'#C9EAF8');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,GH);
+}
+function drawSun() {
+  const sx=W-85, sy=58;
+  const rg=ctx.createRadialGradient(sx,sy,24,sx,sy,70);
+  rg.addColorStop(0,'rgba(255,235,80,0.45)'); rg.addColorStop(1,'rgba(255,235,80,0)');
+  ctx.fillStyle=rg; ctx.fillRect(sx-70,sy-70,140,140);
+  ctx.fillStyle='#FFD600'; ctx.beginPath(); ctx.arc(sx,sy,30,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#FFF8A0'; ctx.beginPath(); ctx.arc(sx,sy,20,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#FFD600'; ctx.lineWidth=2.5;
+  for (let i=0;i<8;i++) {
+    const a=(i/8)*Math.PI*2+tick*0.004;
+    ctx.beginPath(); ctx.moveTo(sx+Math.cos(a)*36,sy+Math.sin(a)*36);
+    ctx.lineTo(sx+Math.cos(a)*50,sy+Math.sin(a)*50); ctx.stroke();
+  }
+}
+let cloudX=[120,360,600,820];
+const cloudY=[52,36,65,44], cloudS=[0.30,0.18,0.36,0.22], cloudW=[90,110,80,100];
+function drawClouds() {
+  ctx.fillStyle='rgba(255,255,255,0.92)';
+  cloudX.forEach((cx,i) => {
+    const r=cloudW[i]*0.28, py=cloudY[i];
+    [[0,0,1],[0.65,-0.3,0.8],[1.35,0,0.9],[2.0,-0.15,0.75],[2.6,0,0.8]].forEach(([ox,oy,f]) => {
+      ctx.beginPath(); ctx.arc(cx+ox*r*2.2,py+oy*r,r*f,0,Math.PI*2); ctx.fill();
+    });
+    cloudX[i]-=cloudS[i]; if (cloudX[i]<-cloudW[i]*3) cloudX[i]=W+60;
+  });
+}
+function drawGround() {
+  const g=ctx.createLinearGradient(0,GND+14,0,GH);
+  g.addColorStop(0,'#7B4F2E'); g.addColorStop(1,'#4A2D18');
+  ctx.fillStyle=g; ctx.fillRect(0,GND+14,W,GH-GND-14);
+  ctx.fillStyle='#5BB836';
+  [[80,110],[280,95],[530,105],[760,90],[920,100]].forEach(([hx,hr]) => {
+    ctx.beginPath(); ctx.ellipse(hx,GND+14,hr,50,0,Math.PI,Math.PI*2); ctx.fill();
+  });
+  ctx.fillStyle='#7DC843'; ctx.fillRect(0,GND+8,W,10);
+  ctx.fillStyle='#5BB836'; ctx.fillRect(0,GND+16,W,4);
+}
+
+// ─── DRAW: PLAYER ──────────────────────────────────────────────────────
+function drawPlayer() {
+  const px=Math.round(player.x-20), py=Math.round(player.y-62);
+  const bob=player.falling?0:Math.sin(tick*0.13)*1.5;
+  const ls=player.falling?-7:Math.sin(tick*0.17)*5;
+  ctx.save(); ctx.translate(0,bob);
+  const shadowA=Math.max(0.04,0.18-(GND-player.y)*0.003);
+  ctx.fillStyle=`rgba(0,0,0,${shadowA})`;
+  ctx.beginPath(); ctx.ellipse(px+20,GND+10,20,5,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#2A5FA0'; ctx.fillRect(px+2,py+27,32,22);
+  ctx.fillStyle='#3672B8'; ctx.fillRect(px+8,py+27,20,12);
+  ctx.fillStyle='#CC3322'; ctx.fillRect(px+0,py+23,36,8);
+  ctx.fillStyle='#CC3322'; ctx.fillRect(px-4,py+23,8,6); ctx.fillRect(px+32,py+23,8,6);
+  ctx.fillStyle='#FFBA80'; ctx.fillRect(px-5,py+27,8,16+ls*0.5); ctx.fillRect(px+33,py+27,8,16-ls*0.5);
+  ctx.fillStyle='#FFBA80'; ctx.fillRect(px+4,py+7,28,20);
+  ctx.fillRect(px+2,py+11,4,8); ctx.fillRect(px+30,py+11,4,8);
+  ctx.fillStyle='#CC3322'; ctx.fillRect(px+2,py,32,11); ctx.fillRect(px-3,py+7,10,5);
+  ctx.fillStyle='#1a1a1a'; ctx.fillRect(px+9,py+12,5,5); ctx.fillRect(px+22,py+12,5,5);
+  ctx.fillStyle='#fff'; ctx.fillRect(px+10,py+12,2,2); ctx.fillRect(px+23,py+12,2,2);
+  ctx.fillStyle='#E8906A'; ctx.fillRect(px+15,py+18,6,4);
+  ctx.fillStyle='#6B3A1F'; ctx.fillRect(px+7,py+22,8,3); ctx.fillRect(px+21,py+22,8,3);
+  ctx.fillStyle='#2A5FA0'; ctx.fillRect(px+3,py+47,13,15+ls*0.4); ctx.fillRect(px+20,py+47,13,15-ls*0.4);
+  ctx.fillStyle='#2A1A00';
+  if (player.falling) { ctx.fillRect(px+1,py+59,16,7); ctx.fillRect(px+19,py+59,16,7); }
+  else { ctx.fillRect(px+1,py+61,17,6); ctx.fillRect(px+18,py+61,17,6); }
+  ctx.restore();
+}
+
+// ─── DRAW: ENEMY (cow box) ─────────────────────────────────────────────
+function drawEnemy(e) {
+  if (!e.alive) return;
+  const ex=Math.round(e.x-28), ey=Math.round(e.y);
+  const BW=56,BH=56, bob=Math.sin(e.wf*0.13)*2.5;
+  ctx.fillStyle='rgba(0,0,0,0.12)';
+  ctx.beginPath(); ctx.ellipse(ex+BW/2,ey+6,BW/2,5,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#5D4037'; ctx.fillRect(ex+BW/2-2,ey-BH-38,4,38);
+  const sw=Math.max(50,e.chord.name.length*13+22), sy2=ey-BH-68;
+  ctx.fillStyle='#1e2d3d'; ctx.beginPath(); ctx.roundRect(ex+BW/2-sw/2,sy2,sw,30,4); ctx.fill();
+  ctx.fillStyle=e.chord.color+'DD'; ctx.fillRect(ex+BW/2-sw/2+2,sy2+2,sw-4,5);
+  ctx.fillStyle='#fff'; ctx.font='bold 16px monospace';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(e.chord.name, ex+BW/2, sy2+16);
+  const by=ey-BH+bob;
+  ctx.fillStyle='#8B5E3C'; ctx.fillRect(ex,by,BW,BH);
+  ctx.fillStyle='#F5DEB3'; ctx.fillRect(ex+7,by+9,BW-14,BH-15);
+  ctx.fillStyle='#1a1a1a';
+  ctx.beginPath(); ctx.arc(ex+17,by+20,5.5,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex+39,by+20,5.5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(ex+15,by+18,2.5,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex+37,by+18,2.5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#E8A0A0'; ctx.beginPath(); ctx.ellipse(ex+BW/2,by+37,13,9,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#1a1a1a';
+  ctx.beginPath(); ctx.arc(ex+BW/2-5,by+37,2.5,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex+BW/2+5,by+37,2.5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#D4B483'; ctx.fillRect(ex+8,by-7,8,11); ctx.fillRect(ex+40,by-7,8,11);
+  ctx.fillStyle='#F5DEB3'; ctx.fillRect(ex+10,by-5,4,9); ctx.fillRect(ex+42,by-5,4,9);
+  ctx.strokeStyle='#6D4C41'; ctx.lineWidth=2; ctx.strokeRect(ex,by,BW,BH);
+  ctx.fillStyle=e.chord.color+'99'; ctx.fillRect(ex+2,by+2,BW-4,5);
+  e.wf++;
+}
+function drawDeath(e) {
+  const age=tick-e.diedAt; if (age>20) return;
+  ctx.save(); ctx.globalAlpha=1-age/20;
+  ctx.translate(Math.round(e.x),Math.round(e.y-28));
+  ctx.scale(1+age/20,1+age/20);
+  ctx.fillStyle=e.chord.color; ctx.font='bold 26px monospace';
+  ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('✓',0,0);
+  ctx.restore();
+}
+
+// ─── DRAW: HUD ─────────────────────────────────────────────────────────
+function drawHUD() {
+  const target = activeChord();
+  // left panel
+  ctx.fillStyle='rgba(5,5,20,0.62)';
+  ctx.beginPath(); ctx.roundRect(8,8,150,128,8); ctx.fill();
+
+  ctx.fillStyle='#999'; ctx.font='9px monospace';
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText('SCORE', 18, 18);
+  ctx.fillStyle='#FFD700'; ctx.font='bold 23px monospace';
+  ctx.fillText(String(score).padStart(6,'0'), 18, 29);
+
+  ctx.fillStyle='#999'; ctx.font='9px monospace';
+  ctx.fillText('COMBO', 18, 62);
+  ctx.fillStyle=combo>0?'#FF9F43':'#444'; ctx.font='bold 19px monospace';
+  ctx.fillText('×'+combo, 18, 73);
+
+  // health bar
+  const hbX=18,hbY=102,hbW=120,hbH=10;
+  ctx.fillStyle='#2a2a2a'; ctx.fillRect(hbX,hbY,hbW,hbH);
+  const pct=lives/10;
+  ctx.fillStyle=pct>0.5?'#FF6B9D':pct>0.25?'#FF9F43':'#FF4444';
+  ctx.fillRect(hbX,hbY,Math.round(hbW*pct),hbH);
+  ctx.strokeStyle='#444'; ctx.lineWidth=1; ctx.strokeRect(hbX,hbY,hbW,hbH);
+  ctx.fillStyle='#888'; ctx.font='9px monospace'; ctx.textBaseline='top';
+  ctx.fillText('HP  '+lives+' / 10', hbX, hbY+13);
+
+  // ── right panel ─────────────────────────────────────────────────────
+  const rpW=230, rpH=134, rpX=W-rpW-8, rpY=8;
+  ctx.fillStyle='rgba(5,5,20,0.78)';
+  ctx.beginPath(); ctx.roundRect(rpX,rpY,rpW,rpH,8); ctx.fill();
+  ctx.strokeStyle=target.color+'88'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.roundRect(rpX,rpY,rpW,rpH,8); ctx.stroke();
+
+  // ── section 1: chord name ───────────────────────────────────────────
+  ctx.fillStyle='#555'; ctx.font='9px monospace';
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText('CHORD NAME', rpX+12, rpY+10);
+
+  // faint music note decoration
+  ctx.fillStyle=target.color+'25'; ctx.font='bold 48px serif';
+  ctx.textAlign='right'; ctx.textBaseline='middle';
+  ctx.fillText('♩', rpX+rpW-8, rpY+38);
+
+  // big chord name
+  ctx.fillStyle=target.color; ctx.font='bold 42px monospace';
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.fillText(target.name, rpX+14, rpY+38);
+
+  // notes label (e.g. "C – E – G")
+  ctx.fillStyle='#444'; ctx.font='10px monospace';
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText('notes: '+target.notes, rpX+14, rpY+62);
+
+  // divider
+  ctx.strokeStyle='#1e1e30'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(rpX+10,rpY+76); ctx.lineTo(rpX+rpW-10,rpY+76); ctx.stroke();
+
+  // ── section 2: keyboard keys ────────────────────────────────────────
+  ctx.fillStyle='#555'; ctx.font='9px monospace';
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText('PRESS KEYS', rpX+12, rpY+81);
+
+  const capW=30, capH=28, capGap=6;
+  const nk=target.keys.length;
+  // total width including '+' labels between caps
+  const totalW=nk*capW+(nk-1)*(capGap+14);
+  const capStartX=rpX+(rpW-totalW)/2;
+  const capY=rpY+95;
+
+  target.keys.forEach((k,i) => {
+    const cx=capStartX+i*(capW+capGap+14);
+
+    // '+' between caps
+    if (i>0) {
+      ctx.fillStyle='#3a3a55'; ctx.font='bold 13px monospace';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText('+', cx-capGap/2-7, capY+capH/2);
+    }
+
+    const isHeld=held.has(k);
+
+    // shadow
+    ctx.fillStyle='rgba(0,0,0,0.5)';
+    ctx.beginPath(); ctx.roundRect(cx+2,capY+2,capW,capH,5); ctx.fill();
+
+    // cap body
+    ctx.fillStyle=isHeld?target.color:'#161628';
+    ctx.beginPath(); ctx.roundRect(cx,capY,capW,capH,5); ctx.fill();
+
+    // cap border
+    ctx.strokeStyle=isHeld?target.color:'#2e2e4a';
+    ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.roundRect(cx,capY,capW,capH,5); ctx.stroke();
+
+    // keyboard letter (large)
+    ctx.fillStyle=isHeld?'#111':'#ccc';
+    ctx.font='bold 15px monospace';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(k.toUpperCase(), cx+capW/2, capY+capH/2-4);
+
+    // note name below (small)
+    ctx.fillStyle=isHeld?'#333':target.color+'99';
+    ctx.font='8px monospace';
+    ctx.fillText(NOTE[k], cx+capW/2, capY+capH-5);
+  });
+
+  // live chord detection
+  const mu=[...held].filter(k=>FREQ[k]);
+  const playing=CHORDS.find(c=>
+    c.keys.length===mu.length &&
+    c.keys.every(k=>mu.includes(k)) &&
+    !mu.some(k=>!c.keys.includes(k))
+  );
+  if (playing) {
+    const ok=playing.name===target.name;
+    ctx.fillStyle=ok?'#90EE90':'#FF8888';
+    ctx.font='bold 11px monospace';
+    ctx.textAlign='center'; ctx.textBaseline='bottom';
+    ctx.fillText(ok?'✓ '+playing.name:'✗ '+playing.name, rpX+rpW/2, rpY+rpH-4);
+  }
+}
+
+// ─── DRAW: PIANO ───────────────────────────────────────────────────────
+function drawPiano() {
+  const target = activeChord();
+  const py=H-PIANO, kw=Math.floor((W-18)/8), km=1;
+  const tot=(kw+km)*8-km, sx=Math.floor((W-tot)/2);
+  ctx.fillStyle='#111122'; ctx.fillRect(0,py,W,PIANO);
+  ctx.fillStyle='#080810'; ctx.fillRect(0,py,W,2);
+
+  // dots above piano for required keys
+  target.keys.forEach(k => {
+    const wi=WKS.indexOf(k), bi=BKS.find(b=>b.k===k);
+    let cx;
+    if (wi>=0) cx=sx+wi*(kw+km)+kw/2;
+    else if (bi) cx=sx+bi.p*(kw+km)+Math.floor(kw*0.71)+Math.floor(kw*0.58)/2;
+    if (cx==null) return;
+    const isHeld=held.has(k);
+    ctx.fillStyle=isHeld?target.color:target.color+'44';
+    ctx.beginPath(); ctx.arc(cx,py-7,5,0,Math.PI*2); ctx.fill();
+    if (isHeld) { ctx.strokeStyle=target.color; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(cx,py-7,8,0,Math.PI*2); ctx.stroke(); }
+  });
+
+  // white keys
+  WKS.forEach((k,i) => {
+    const kx=sx+i*(kw+km), isHeld=held.has(k), isReq=target.keys.includes(k);
+    if (isHeld&&isReq)       ctx.fillStyle=target.color;
+    else if (isHeld)         ctx.fillStyle='#FF9999';
+    else if (isReq)          ctx.fillStyle=target.color+'44';
+    else                     ctx.fillStyle='#F0EFE8';
+    ctx.fillRect(kx,py+4,kw,PIANO-10);
+    ctx.strokeStyle='#C8C8C2'; ctx.lineWidth=1; ctx.strokeRect(kx,py+4,kw,PIANO-10);
+    ctx.fillStyle=(isHeld&&isReq)?'#111':'#888'; ctx.font='bold 11px monospace';
+    ctx.textAlign='center'; ctx.textBaseline='bottom';
+    ctx.fillText(k.toUpperCase(), kx+kw/2, py+PIANO-14);
+    ctx.fillStyle='#aaa'; ctx.font='9px monospace';
+    ctx.fillText(NOTE[k], kx+kw/2, py+PIANO-4);
+  });
+
+  // black keys
+  const bw=Math.floor(kw*0.58);
+  BKS.forEach(({k,p}) => {
+    const kx=sx+p*(kw+km)+Math.floor(kw*0.71);
+    const isHeld=held.has(k), isReq=target.keys.includes(k);
+    if (isHeld&&isReq)  ctx.fillStyle=target.color;
+    else if (isHeld)    ctx.fillStyle='#882222';
+    else if (isReq)     ctx.fillStyle=target.color+'66';
+    else                ctx.fillStyle='#111118';
+    ctx.fillRect(kx,py+4,bw,Math.floor((PIANO-10)*0.62));
+    ctx.fillStyle=(isHeld&&isReq)?'#111':(isReq?target.color:'#555');
+    ctx.font='bold 8px monospace'; ctx.textAlign='center'; ctx.textBaseline='bottom';
+    ctx.fillText(k.toUpperCase(), kx+bw/2, py+4+Math.floor((PIANO-10)*0.62)-1);
+  });
+}
+
+// ─── SCREENS ───────────────────────────────────────────────────────────
+function drawStart() {
+  ctx.fillStyle='rgba(0,0,14,0.82)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.fillStyle='#FFD700'; ctx.font='bold 58px monospace';
+  ctx.textBaseline='middle'; ctx.fillText('CHORD RUNNER', W/2, H/2-90);
+  ctx.fillStyle='#ccc'; ctx.font='16px monospace';
+  ctx.fillText('Hold the correct piano keys to play each chord', W/2, H/2-30);
+  ctx.fillText('Defeat enemies before they reach you!', W/2, H/2+2);
+
+  // chord cheat sheet with key caps
+  ctx.fillStyle='#555'; ctx.font='11px monospace';
+  ctx.fillText('Chords in this game:', W/2, H/2+40);
+  const cw=145;
+  CHORDS.forEach((c,i) => {
+    const cx=W/2+(i-CHORDS.length/2+0.5)*cw;
+    ctx.fillStyle=c.color; ctx.font='bold 16px monospace';
+    ctx.fillText(c.name, cx, H/2+62);
+    // tiny key caps
+    const capW=20, capH=18, gap=3;
+    const total=c.keys.length*capW+(c.keys.length-1)*gap;
+    c.keys.forEach((k,ki) => {
+      const capX=cx-total/2+ki*(capW+gap);
+      ctx.fillStyle='#1c1c30'; ctx.beginPath(); ctx.roundRect(capX,H/2+70,capW,capH,3); ctx.fill();
+      ctx.strokeStyle=c.color+'66'; ctx.lineWidth=1; ctx.beginPath(); ctx.roundRect(capX,H/2+70,capW,capH,3); ctx.stroke();
+      ctx.fillStyle='#ccc'; ctx.font='bold 9px monospace'; ctx.textBaseline='middle';
+      ctx.fillText(k.toUpperCase(), capX+capW/2, H/2+79);
+    });
+    // note names below caps
+    ctx.fillStyle='#444'; ctx.font='8px monospace'; ctx.textBaseline='top';
+    ctx.fillText(c.notes, cx, H/2+91);
+  });
+
+  ctx.fillStyle='#FFD700'; ctx.font='bold 18px monospace';
+  ctx.globalAlpha=0.6+0.4*Math.sin(tick*0.06); ctx.textBaseline='middle';
+  ctx.fillText('— SPACE or ENTER to start —', W/2, H/2+118);
+  ctx.globalAlpha=1;
+}
+
+function drawGameOver() {
+  ctx.fillStyle='rgba(0,0,14,0.85)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#FF6B6B'; ctx.font='bold 58px monospace';
+  ctx.fillText('GAME OVER', W/2, H/2-64);
+  ctx.fillStyle='#FFD700'; ctx.font='bold 28px monospace';
+  ctx.fillText('Score: '+score, W/2, H/2-2);
+  ctx.fillStyle='#888'; ctx.font='16px monospace';
+  ctx.fillText('Best combo: ×'+combo, W/2, H/2+34);
+  ctx.fillStyle='#fff'; ctx.font='bold 18px monospace';
+  ctx.globalAlpha=0.6+0.4*Math.sin(tick*0.06);
+  ctx.fillText('SPACE to play again', W/2, H/2+76); ctx.globalAlpha=1;
+}
+
+// ─── MAIN LOOP ─────────────────────────────────────────────────────────
+let lastT=0;
+function loop(ts) {
+  const dt=Math.min(ts-lastT,50); lastT=ts; tick++;
+  ctx.clearRect(0,0,W,H);
+
+  if (shake>0.15) { ctx.save(); ctx.translate((Math.random()-.5)*shake,(Math.random()-.5)*shake); shake*=0.72; }
+  else { shake=0; ctx.save(); }
+
+  drawSky(); drawSun(); drawClouds(); drawGround();
+
+  if (state==='playing') {
+    spawnCD-=dt;
+    if (spawnCD<=0) { spawnEnemy(); spawnCD=spawnRate; }
+
+    enemies.forEach(e => {
+      if (!e.alive) { drawDeath(e); return; }
+      e.x-=e.speed;
+      if (e.x<player.x+22) {
+        e.alive=false; e.diedAt=tick;
+        lives--; combo=0; shake=10; sfxHit();
+        burst(e.x,e.y-28,'#FF4444');
+        if (lives<=0) state='gameover';
+      }
+      drawEnemy(e);
+    });
+    for (let i=enemies.length-1;i>=0;i--) {
+      if (!enemies[i].alive&&tick-enemies[i].diedAt>24) enemies.splice(i,1);
+    }
+
+    player.vy+=0.72; player.y+=player.vy;
+    if (player.y>=GND) { player.y=GND; player.vy=0; player.falling=false; }
+    drawPlayer();
+
+    ctx.save();
+    for (let i=sparks.length-1;i>=0;i--) {
+      const p=sparks[i];
+      ctx.globalAlpha=p.life; ctx.fillStyle=p.col;
+      ctx.fillRect(p.x-p.sz/2,p.y-p.sz/2,p.sz,p.sz);
+      p.x+=p.vx; p.y+=p.vy; p.vy+=0.24; p.life-=0.04; p.sz*=0.97;
+      if (p.life<=0) sparks.splice(i,1);
+    }
+    for (let i=pops.length-1;i>=0;i--) {
+      const p=pops[i];
+      ctx.globalAlpha=p.life; ctx.fillStyle=p.col;
+      ctx.font='bold 20px monospace'; ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(p.txt,p.x,p.y); p.y-=1.4; p.life-=0.033;
+      if (p.life<=0) pops.splice(i,1);
+    }
+    ctx.restore();
+
+    gameSpd=Math.min(3.5,1+score/1400);
+    drawHUD();
+  }
+
+  drawPiano();
+  ctx.restore();
+
+  if (state==='start')    drawStart();
+  if (state==='gameover') drawGameOver();
+  requestAnimationFrame(loop);
+}
+
+state='start';
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
